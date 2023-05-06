@@ -1,0 +1,8 @@
+Assurez-vous d'installer la bibliothèque wiringPi et les headers pour MySQL avant de compiler ce code. 
+Vous pouvez les installer avec les commandes suivantes:
+```
+sudo apt-get install wiringpi
+sudo apt-get install libmysqlclient-dev
+sudo apt-get install libmicrohttpd-dev
+
+```
