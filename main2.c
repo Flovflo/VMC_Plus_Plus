@@ -1,3 +1,4 @@
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -6,6 +7,9 @@
 #include <pthread.h>
 #include <wiringPi.h>
 #include <unistd.h>
+#include <mysql.h>
+
+//compilation : gcc -o main3 main3.c -lcurl -lpthread -lwiringPi -lcjson -lmysqlclient -I/usr/include/mysql
 
 #define RelayPin 0  // Correspond à GPIO17 si vous utilisez WiringPi
 
@@ -18,8 +22,73 @@ pthread_mutex_t data_mutex;
 double temperature, humidity;
 int etatVMC;
 
+MYSQL *con;
+
+void finish_with_error(MYSQL *con)
+{
+  fprintf(stderr, "%s\n", mysql_error(con));
+  mysql_close(con);
+  exit(1);        
+}
+
+void init_db() {
+  con = mysql_init(NULL);
+  
+  if (con == NULL) {
+      fprintf(stderr, "mysql_init() failed\n");
+      exit(1);
+  }
+  
+  if (mysql_real_connect(con, "host", "user", "password", "database", 0, NULL, 0) == NULL) {
+      finish_with_error(con);
+  }    
+}
+
+void GetLog(double temperature, double humidity) {
+  char query[100];
+
+  sprintf(query, "INSERT INTO weather_data(temperature, humidity) VALUES(%f, %f)", temperature, humidity);
+
+  if (mysql_query(con, query)) {
+      finish_with_error(con);
+  }
+}
+
+double lireparam(char* param_name) {
+  char query[100];
+  double value;
+
+  sprintf(query, "SELECT value FROM parameters WHERE name='%s'", param_name);
+
+  if (mysql_query(con, query)) {
+      finish_with_error(con);
+  }
+
+  MYSQL_RES *result = mysql_store_result(con);
+
+  if (result == NULL) {
+      finish_with_error(con);
+  }
+
+  MYSQL_ROW row = mysql_fetch_row(result);
+  value = atof(row[0]);
+  mysql_free_result(result);
+
+  return value;
+}
+
+void modifparam(char* param_name, double new_value) {
+  char query[100];
+
+  sprintf(query, "UPDATE parameters SET value=%f WHERE name='%s'", new_value, param_name);
+
+  if (mysql_query(con, query)) {
+      finish_with_error(con);
+  }
+}
+
 static size_t WriteMemoryCallback(void *contents, size_t size, size_t nmemb, void *userp) {
-  size_t realsize = size * nmemb;
+   size_t realsize = size * nmemb;
   struct MemoryStruct *mem = (struct MemoryStruct *)userp;
 
   char *ptr = realloc(mem->memory, mem->size + realsize + 1);
@@ -37,8 +106,8 @@ static size_t WriteMemoryCallback(void *contents, size_t size, size_t nmemb, voi
   return realsize;
 }
 
-void *fetchTemperatureHumidity(void *arg) {
-  while (1) {
+void *MessureAction(void *arg) {
+   while (1) {
     CURL *curl_handle;
     CURLcode res;
 
@@ -52,18 +121,20 @@ void *fetchTemperatureHumidity(void *arg) {
     curl_handle = curl_easy_init();
 
     // Use your own URL, headers, and other CURL options here
-    curl_easy_setopt(curl_handle, CURLOPT_URL, "https://openapi.tuyaeu.com/v1.0/devices/bf4aa81bfcb66ccb96rybs/status");
-    struct curl_slist *headers = NULL;
-    headers = curl_slist_append(headers, "sign_method: HMAC-SHA256");
-    headers = curl_slist_append(headers, "client_id: f5ujcnr98swqnhca5vcy");
-    headers = curl_slist_append(headers, "t: 1684414976667");
-    headers = curl_slist_append(headers, "mode: cors");
-    headers = curl_slist_append(headers, "Content-Type: application/json");
-    headers = curl_slist_append(headers, "sign: 52619FFAAADC4A46902DAB977C50A06475C018209BECFCC42560C17574ACCECD");
-    headers = curl_slist_append(headers, "access_token: a0e6c3d9398e64276522ecf95656ae16");
-    curl_easy_setopt(curl_handle, CURLOPT_HTTPHEADER, headers);
-    curl_easy_setopt(curl_handle, CURLOPT_WRITEFUNCTION, WriteMemoryCallback);
-    curl_easy_setopt(curl_handle, CURLOPT_WRITEDATA, (void *)&chunk);
+
+  curl_easy_setopt(curl_handle, CURLOPT_URL, "https://openapi.tuyaeu.com/v1.0/devices/bf4aa81bfcb66ccb96rybs/status");
+  struct curl_slist *headers = NULL;
+  headers = curl_slist_append(headers, "sign_method: HMAC-SHA256");
+  headers = curl_slist_append(headers, "client_id: f5ujcnr98swqnhca5vcy");
+  headers = curl_slist_append(headers, "t: 1684414976667");
+  headers = curl_slist_append(headers, "mode: cors");
+  headers = curl_slist_append(headers, "Content-Type: application/json");
+  headers = curl_slist_append(headers, "sign: 52619FFAAADC4A46902DAB977C50A06475C018209BECFCC42560C17574ACCECD");
+  headers = curl_slist_append(headers, "access_token: a0e6c3d9398e64276522ecf95656ae16");
+  curl_easy_setopt(curl_handle, CURLOPT_HTTPHEADER, headers);
+  curl_easy_setopt(curl_handle, CURLOPT_WRITEFUNCTION, WriteMemoryCallback);
+  curl_easy_setopt(curl_handle, CURLOPT_WRITEDATA, (void *)&chunk);
+
 
     res = curl_easy_perform(curl_handle);
 
@@ -116,7 +187,7 @@ void *fetchTemperatureHumidity(void *arg) {
 }
 
 void *control_relay(void *arg) {
-  // load system parameters from MySQL database
+    // load system parameters from MySQL database
   // Note: You need to replace this with your own code to connect to
   //       your MySQL database and read the system parameters.
 
@@ -149,18 +220,20 @@ int main() {
       return -1; 
   }
   
-  pinMode(RelayPin, OUTPUT);
+  init_db();
 
   pthread_mutex_init(&data_mutex, NULL);
 
   pthread_t thread1, thread2;
-  pthread_create(&thread1, NULL, fetchTemperatureHumidity, NULL);
+  pthread_create(&thread1, NULL, MessureAction, NULL);
   pthread_create(&thread2, NULL, control_relay, NULL);
 
   pthread_join(thread1, NULL);
   pthread_join(thread2, NULL);
 
   pthread_mutex_destroy(&data_mutex);
+
+  mysql_close(con);
 
   return 0;
 }
