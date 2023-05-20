@@ -1,4 +1,3 @@
-
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -9,7 +8,7 @@
 #include <unistd.h>
 #include <mysql.h>
 
-//compilation : gcc -o main3 main3.c -lcurl -lpthread -lwiringPi -lcjson -lmysqlclient -I/usr/include/mysql
+// Compilation : gcc -o main3 main3.c -lcurl -lpthread -lwiringPi -lcjson -lmysqlclient -I/usr/include/mysql
 
 #define RelayPin 0  // Correspond à GPIO17 si vous utilisez WiringPi
 
@@ -18,12 +17,13 @@ struct MemoryStruct {
   size_t size;
 };
 
-pthread_mutex_t data_mutex;
-double temperature, humidity;
-int etatVMC;
+pthread_mutex_t data_mutex; // Mutex pour protéger les variables de température, d'humidité et d'état VMC
+double temperature, humidity; // Variables pour stocker les mesures de température et d'humidité
+int etatVMC; // Variable pour stocker l'état de la VMC (Ventilation Mécanique Contrôlée)
 
-MYSQL *con;
+MYSQL *con; // Connection à la base de données MySQL
 
+// Gérer les erreurs avec MySQL
 void finish_with_error(MYSQL *con)
 {
   fprintf(stderr, "%s\n", mysql_error(con));
@@ -31,6 +31,7 @@ void finish_with_error(MYSQL *con)
   exit(1);        
 }
 
+// Initialiser la connexion à la base de données
 void init_db() {
   con = mysql_init(NULL);
   
@@ -44,6 +45,7 @@ void init_db() {
   }    
 }
 
+// Ecrire les mesures de température et d'humidité dans la base de données
 void GetLog(double temperature, double humidity) {
   char query[100];
 
@@ -54,6 +56,7 @@ void GetLog(double temperature, double humidity) {
   }
 }
 
+// Lire les paramètres de la base de données
 double lireparam(char* param_name) {
   char query[100];
   double value;
@@ -77,6 +80,7 @@ double lireparam(char* param_name) {
   return value;
 }
 
+// Modifier les paramètres dans la base de données
 void modifparam(char* param_name, double new_value) {
   char query[100];
 
@@ -87,14 +91,15 @@ void modifparam(char* param_name, double new_value) {
   }
 }
 
+// Rappel de fonction pour écrire dans une structure mémoire
 static size_t WriteMemoryCallback(void *contents, size_t size, size_t nmemb, void *userp) {
    size_t realsize = size * nmemb;
   struct MemoryStruct *mem = (struct MemoryStruct *)userp;
 
   char *ptr = realloc(mem->memory, mem->size + realsize + 1);
   if(ptr == NULL) {
-    /* out of memory! */ 
-    printf("Not enough memory (realloc returned NULL)\n");
+    /* pas assez de mémoire ! */ 
+    printf("Pas assez de mémoire (realloc a renvoyé NULL)\n");
     return 0;
   }
 
@@ -106,8 +111,9 @@ static size_t WriteMemoryCallback(void *contents, size_t size, size_t nmemb, voi
   return realsize;
 }
 
+// Récupérer et traiter les données de température et d'humidité
 void *MessureAction(void *arg) {
-   while (1) {
+    while (1) {
     CURL *curl_handle;
     CURLcode res;
 
@@ -186,54 +192,55 @@ void *MessureAction(void *arg) {
   return NULL;
 }
 
+// Contrôler l'état du relais
 void *control_relay(void *arg) {
-    // load system parameters from MySQL database
-  // Note: You need to replace this with your own code to connect to
-  //       your MySQL database and read the system parameters.
+    // Charger les paramètres système de la base de données MySQL
 
-  while (1) {
-    int turn_on;
+    while (1) {
+        int turn_on;  // Variable pour déterminer si le relais doit être activé ou non
 
-    pthread_mutex_lock(&data_mutex);
-    // if the system is in manual mode, the relay state is determined by etatVMC
-    // if the system is not in manual mode, the relay is turned on if any of the sensor readings are outside the set limits
-    // Note: You need to replace this with your own logic for controlling the relay based on the sensor data and system parameters.
-    pthread_mutex_unlock(&data_mutex);
+        pthread_mutex_lock(&data_mutex); // Verrouiller le mutex pour protéger les variables partagées
+        // Si le système est en mode manuel, l'état du relais est déterminé par etatVMC
+        // Si le système n'est pas en mode manuel, le relais est activé si une des mesures des capteurs est hors des limites définies
+        // Note : Vous devez remplacer ceci par votre propre logique pour contrôler le relais en fonction des données des capteurs et des paramètres du système.
+        pthread_mutex_unlock(&data_mutex); // Déverrouiller le mutex après modification des variables partagées
 
-    if (turn_on) {
-      digitalWrite(RelayPin, LOW);
-      printf("Relay ON\n");
-    } else {
-      digitalWrite(RelayPin, HIGH);
-      printf("Relay OFF\n");
+        // Active ou désactive le relais en fonction de l'état de la variable turn_on
+        if (turn_on) {
+            digitalWrite(RelayPin, LOW); // Met le GPIO à LOW pour activer le relais
+            printf("Relais activé\n");
+        } else {
+            digitalWrite(RelayPin, HIGH); // Met le GPIO à HIGH pour désactiver le relais
+            printf("Relais désactivé\n");
+        }
+
+        sleep(1);  // Attendre avant de vérifier à nouveau les données du capteur
     }
 
-    sleep(1);  // wait before checking sensor data again
-  }
-
-  return NULL;
+    return NULL;
 }
 
+// Point d'entrée du programme
 int main() {
   if(wiringPiSetup() == -1){ 
       printf("setup wiringPi failed !\n");
       return -1; 
   }
   
-  init_db();
+  init_db(); // Initialisation de la base de données
 
-  pthread_mutex_init(&data_mutex, NULL);
+  pthread_mutex_init(&data_mutex, NULL); // Initialisation du mutex
 
-  pthread_t thread1, thread2;
+  pthread_t thread1, thread2; // Threads pour exécuter les fonctions de mesure et de contrôle
   pthread_create(&thread1, NULL, MessureAction, NULL);
   pthread_create(&thread2, NULL, control_relay, NULL);
 
-  pthread_join(thread1, NULL);
+  pthread_join(thread1, NULL); // Attendre que les threads se terminent
   pthread_join(thread2, NULL);
 
-  pthread_mutex_destroy(&data_mutex);
+  pthread_mutex_destroy(&data_mutex); // Destruction du mutex
 
-  mysql_close(con);
+  mysql_close(con); // Fermer la connexion à la base de données
 
   return 0;
 }
