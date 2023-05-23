@@ -1,6 +1,6 @@
 # Programmation du contrôleur VMC
 
-Ce programme permet de contrôler un système de ventilation mécanique contrôlée (VMC) en utilisant un Raspberry Pi. Le programme est écrit en langage C et utilise différentes bibliothèques pour interagir avec les capteurs, les relais et les connexions WebSocket.
+Le code est un programme en langage C qui contrôle une ventilation mécanique contrôlée (VMC) via un Raspberry Pi. Il mesure la température et l'humidité à l'aide d'un capteur DHT11, contrôle un relais GPIO pour allumer ou éteindre la VMC en fonction des conditions et communique avec un client WebSocket pour permettre le contrôle à distance et l'affichage des mesures.
 
 ## Dépendances
 
@@ -12,5 +12,5 @@ Avant de compiler et exécuter le programme, assurez-vous d'avoir installé les 
 
 ## Compilation
 
-Pour compiler le programme, exécutez la commande suivante dans le répertoire du projet :
+Pour compiler le programme, exécutez la commande suivante dans le répertoire du projet : make
 
