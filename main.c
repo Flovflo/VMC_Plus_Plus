@@ -1,305 +1,304 @@
 #include <stdio.h>
 #include <stdlib.h>
-#include <stdint.h>
-#include <wiringPi.h>
-#include <pthread.h>
-#include <mysql/mysql.h>
-//#include "PIM357.h"
-//#include "PIM480.h"
-#include <microhttpd.h>
 #include <string.h>
-#include <json-c/json.h>
+#include <curl/curl.h>
+#include <cjson/cJSON.h>
+#include <pthread.h>
+#include <wiringPi.h>
+#include <unistd.h>
+#include <libwebsockets.h>
+#include <sqlite3.h>
 
-#define RELAY_PIN 0 // Broche GPIO pour le relais
+//compilation : gcc main8.c -o exe -lwiringPi -lsqlite3 -lpthread -lwebsockets
 
-// Variables globales
-pthread_mutex_t data_mutex;
-int temp, humidity, eCO2, tVOC;
-int manual_mode = 0;
-int relay_state = 0;
+//define DHT11
+#define MAX_TIME 85
+#define DHT11PIN 2
 
-// Connexion à la base de données
-MYSQL *conn;
+#define Hmax 70
+#define Tmax 39
 
-// Paramètres du tableau Param
-int Tmax, Tmin, Hmax, Hmin, eCO2Max, eCO2Min, TvocMax, TvocMin, dVentileMax, dVentileMin, etatVMC;
+//define relais
+#define RelayPin 0  // Correspond à GPIO17 si vous utilisez WiringPi
 
-// Déclarations de fonctions
-void *measure_data(void *arg);
+//definitions des fonctions
+void dht11_read_val();
+int insertLog(int t, int h, int eco, int tvoc, int etatVMC);
+void *MessureAction(void *arg);
 void *control_relay(void *arg);
-void update_database(int temp, int humidity, int eCO2, int tVOC, int relay_state);
-void init_database();
-void fetch_parameters();
-int handle_http_request(void *cls, struct MHD_Connection *connection, const char *url, const char *method, const char *version, const char *upload_data, size_t *upload_data_size, void **ptr);
+int callback_ws(struct lws *wsi, enum lws_callback_reasons reason, void *user, void *in, size_t len);
 
+//variables globales
+	//valeurs mesurés par le DHT11
+	int dht11_val[5]={0,0,0,0,0};
+	// Mutex pour protéger les variables de température, d'humidité et d'état VMC
+	pthread_mutex_t data_mutex; 
+	// Déclaration de la structure pour le contexte du serveur WebSocket
+	struct lws_context *context;
+	struct lws_protocols protocols[] = {
+		{
+			"vmc-protocol",
+			callback_ws,
+			0,
+			0,
+		},
+		{ NULL, NULL, 0, 0 } // terminateur de tableau
+	};
+	int automatique = 0;
+
+// Point d'entrée du programme
 int main() {
-    // Initialisation de WiringPi
-    wiringPiSetup();
-    pinMode(RELAY_PIN, OUTPUT);
-    digitalWrite(RELAY_PIN, LOW);
+  
+  struct lws_context_creation_info info;
+  memset(&info, 0, sizeof(info));
+  
+  if(wiringPiSetup() == -1){ 
+      printf("setup wiringPi failed !\n");
+      return -1; 
+  }
+  
+	pinMode(RelayPin, OUTPUT);
+    // Configuration du contexte du serveur WebSocket
+    info.port = 8000;
+    info.iface = NULL;
+    info.protocols = protocols;
+    info.extensions = NULL;
+    info.gid = -1;
+    info.uid = -1;
+    info.options |= LWS_SERVER_OPTION_DO_SSL_GLOBAL_INIT;
 
-    // Initialisation du mutex
-    pthread_mutex_init(&data_mutex, NULL);
-
-    // Initialisation de la base de données
-    init_database();
-
-    // Récupération des paramètres dans le tableau Param
-    fetch_parameters();
-
-    // Créer des fils de discussion
-    pthread_t measure_thread, relay_thread;
-    pthread_create(&measure_thread, NULL, measure_data, NULL);
-    pthread_create(&relay_thread, NULL, control_relay, NULL);
-
-    // Initialisation et démarrage du serveur HTTP
-    struct MHD_Daemon *daemon;
-    daemon = MHD_start_daemon(MHD_USE_SELECT_INTERNALLY, 8888, NULL, NULL, &handle_http_request, NULL, MHD_OPTION_END);
-
-    if (daemon == NULL) {
-        fprintf(stderr, "Failed to start HTTP server\n");
-        return 1;
+    // Création du contexte du serveur WebSocket
+    context = lws_create_context(&info);
+    if (context == NULL)
+    {
+        fprintf(stderr, "Erreur lors de la création du contexte du serveur WebSocket\n");
+        return -1;
     }
 
-    // Attendre l'intervention de l'utilisateur pour arrêter le serveur
-    getchar();
+	pthread_mutex_init(&data_mutex, NULL); // Initialisation du mutex
+  pthread_t thread1, thread2, thread3; // Threads pour exécuter les fonctions de mesure, de contrôle, requete getLog,de changement de param
+  pthread_create(&thread1, NULL, MessureAction, NULL);
+  pthread_create(&thread2, NULL, control_relay, NULL);
+  //pthread_create(&thread3, NULL, GetLogs, NULL);
 
-    // Arrêt du serveur HTTP et nettoyage
-    MHD_stop_daemon(daemon);
+  pthread_join(thread1, NULL); // Attendre que les threads se terminent
+  pthread_join(thread2, NULL);
 
-    // Clean
-    mysql_close(conn);
-    pthread_mutex_destroy(&data_mutex);
-    digitalWrite(RELAY_PIN, LOW);
+  //pthread_mutex_destroy(&data_mutex); // Destruction du mutex
+	
+	// Destruction du contexte du serveur WebSocket
+    //lws_context_destroy(context);
+    
+  return 0;
+}
+
+/*
+ *Function :  MessureAction
+ *Description : thread enregistrant continuellement les mesures du capteurs dans la BDD
+ */
+void *MessureAction(void *arg) {
+  while(1)
+  {
+     pthread_mutex_lock(&data_mutex);
+     dht11_read_val();
+     pthread_mutex_unlock(&data_mutex);
+     delay(1000);
+  }
+  return 0;
+}
+
+/*
+ *Function :  dht11_read_val
+ *Description : mesure la température et l'humidité et la stock dans dht11_val
+ */
+void dht11_read_val()
+{
+  uint8_t lststate=HIGH;
+  uint8_t counter=0;
+  uint8_t j=0,i;
+  float farenheit;
+  for(i=0;i<5;i++)
+     dht11_val[i]=0;
+     
+  pinMode(DHT11PIN,OUTPUT);
+  digitalWrite(DHT11PIN,LOW);
+  delay(18);
+  digitalWrite(DHT11PIN,HIGH);
+  delayMicroseconds(40);
+  pinMode(DHT11PIN,INPUT);
+  for(i=0;i<MAX_TIME;i++)
+  {
+    counter=0;
+    while(digitalRead(DHT11PIN)==lststate){
+      counter++;
+      delayMicroseconds(1);
+      if(counter==255)
+        break;
+    }
+    lststate=digitalRead(DHT11PIN);
+    if(counter==255)
+       break;
+    // top 3 transitions are ignored
+    if((i>=4)&&(i%2==0)){
+      dht11_val[j/8]<<=1;
+      if(counter>16)
+        dht11_val[j/8]|=1;
+      j++;
+    }
+  }
+  // verify checksum and print the verified data
+  if((j>=40)&&(dht11_val[4]==((dht11_val[0]+dht11_val[1]+dht11_val[2]+dht11_val[3])& 0xFF)))
+  {
+    farenheit=dht11_val[2]*9./5.+32;
+    printf("Humidity = %d.%d %% Temperature = %d.%d *C (%.1f *F)\n",dht11_val[0],dht11_val[1],dht11_val[2],dht11_val[3],farenheit);
+    insertLog(dht11_val[2], dht11_val[0], dht11_val[1], dht11_val[3], !digitalRead(RelayPin));
+  }
+  //else
+    //rintf("Invalid Data!!\n");
+}
+
+/*
+ *Function :  insertLog
+ *Description : insère les mesures du capteurs dans la table, avec la date actuelle.
+ */
+int insertLog(int t, int h, int eco, int tvoc, int etatVMC){
+	sqlite3 *db;
+    char *err_msg = 0;
+    
+    //open database
+    int rc = sqlite3_open("vmc.db", &db);
+    if (rc != SQLITE_OK) {
+        fprintf(stderr, "Cannot open database: %s\n", sqlite3_errmsg(db));
+        sqlite3_close(db);
+        return 1;
+    }
+    
+	//Allocation dynamique
+	char *sql = malloc(100* sizeof(char));
+	if(sql == NULL){
+		fprintf(stderr, "Erreur d'allocation mémoire");
+		return 1;
+	}
+	
+	//obtention de la date actuelle
+	time_t now = time(NULL);
+	struct tm *tm_info = localtime(&now);
+	char timestamp[20];
+	strftime(timestamp, sizeof(timestamp), "%Y-%m-%d %H:%M:%S", tm_info);
+	
+	//Requete
+	sprintf(sql, "INSERT INTO logs (date, t, h, eco, tvoc, etatVMC) VALUES ('%s', %d, %d, %d, %d, %d);",timestamp, t,h,eco,tvoc,etatVMC);
+    rc = sqlite3_exec(db, sql, 0, 0, &err_msg);
+    
+    //erreurs
+    if (rc != SQLITE_OK) {
+        fprintf(stderr, "SQL error: %s\n", err_msg);
+        sqlite3_free(err_msg);
+        free(sql);
+        return 1;
+    }
+    //fin
+    free(sql);
+    sqlite3_close(db);
+	return 0;
+}
+
+/*
+ *Function :  callback_ws
+ *Description : Callback appelée lorsqu'un message est reçu du client WebSocket
+ */
+int callback_ws(struct lws *wsi, enum lws_callback_reasons reason, void *user, void *in, size_t len)
+{
+    switch (reason)
+    {
+        case LWS_CALLBACK_ESTABLISHED:
+            printf("Connexion WebSocket établie\n");
+            break;
+
+        case LWS_CALLBACK_RECEIVE:
+            // Message reçu du client WebSocket
+            printf("Message reçu du client WebSocket : %.*s\n", (int)len, (char *)in);
+            char *message = (char *)in;
+            message[len] = '\0';
+            //printf("%s !!",message);
+
+            // Vous pouvez traiter les messages ici et envoyer une réponse si nécessaire
+            if(strcmp(message, "0")==0){
+                automatique=0;
+                // Eteint VMC
+                printf("éteint\n");
+                digitalWrite(RelayPin, HIGH); // Met le GPIO à HIGH pour désactiver le relais
+                //printf("Relais désactivé\n");
+                //lws_write(wsi, (unsigned char*)"VMC éteinte", 12, LWS_WRITE_TEXT);
+                //lws_write(wsi, (unsigned char*)"VMC off", sizeof("VMC off"), LWS_WRITE_TEXT);
+                //Eteint VMC
+                
+                
+            }
+            else if(strcmp(message, "1")==0){
+                automatique=0;
+                // allume VMC
+                printf("allume\n");
+                digitalWrite(RelayPin, LOW); // Met le GPIO à LOW pour activer le relais
+                //lws_write(wsi, (unsigned char*)"VMC allumé", sizeof("VMC allumé"), LWS_WRITE_TEXT);
+                //printf("Relais activé\n");
+                //lws_write(wsi, (unsigned char*)"VMC allumée", sizeof("VMC allumée"), LWS_WRITE_TEXT);
+                //allume VMC
+                
+            }
+            else if (strcmp(message, "2")==0){
+				automatique=1;
+            }
+            else{
+					//printf("Valeur inattendue\n");
+					//lws_write(wsi, (unsigned char*)"Valeur inattendue", sizeof("Valeur inattendue"), LWS_WRITE_TEXT);
+				}
+            break;
+
+            case LWS_CALLBACK_SERVER_WRITEABLE:
+                {
+                    char buf[LWS_PRE + 512];
+                    char *p = &buf[LWS_PRE];
+                    pthread_mutex_lock(&data_mutex);
+                    int n = sprintf(p, "Humidity = %d.%d %% Temperature = %d.%d *C",
+                                    dht11_val[0], dht11_val[1], dht11_val[2], dht11_val[3]);
+                    pthread_mutex_unlock(&data_mutex);
+                    lws_write(wsi, (unsigned char*)p, n, LWS_WRITE_TEXT);
+                    break;
+                }
+
+
+        default:
+            break;
+    }
+    
+    //mode automatique
+    if(automatique==1){
+			pthread_mutex_lock(&data_mutex);
+			if(dht11_val[0]>Hmax || dht11_val[2]>Tmax){//si temperature > 39° et humidité > 70%
+				printf("allume\n");
+                digitalWrite(RelayPin, LOW); // Met le GPIO à LOW pour activer le relais
+				
+			}else{
+				printf("éteint\n");
+                digitalWrite(RelayPin, HIGH); // Met le GPIO à HIGH pour désactiver le relais
+			}
+            lws_callback_on_writable(wsi); 
+			pthread_mutex_unlock(&data_mutex);
+	}
 
     return 0;
 }
 
-void *measure_data(void *arg) {
-    PIM357 sensor357;
-    PIM480 sensor480;
-
-    while (1) {
-        // Lire les données des capteurs
-        temp = sensor357.readTemperature();
-        humidity = sensor357.readHumidity();
-        eCO2 = sensor480.readCO2();
-        tVOC = sensor480.readTVOC();
-
-        // Verrouiller le mutex et mettre à jour les variables globales
-        pthread_mutex_lock(&data_mutex);
-        update_database(temp, humidity, eCO2, tVOC, relay_state);
-        pthread_mutex_unlock(&data_mutex);
-
-       // Veille pendant un certain temps avant de prendre la mesure suivante
-        sleep(60);
-    }
-}
-
+/*
+ *Function :  control_relay
+ *Description : contrôle régulièrement l'état du relais.
+ */
 void *control_relay(void *arg) {
-    while (1) {
-        int turn_on = 0;
-                // Vérifiez si le relais doit être activé en fonction des paramètres
-        pthread_mutex_lock(&data_mutex);
-        if (manual_mode) {
-            turn_on = etatVMC;
-        } else {
-            if (temp > Tmax || temp < Tmin || humidity > Hmax || humidity < Hmin || eCO2 > eCO2Max || eCO2 < eCO2Min || tVOC > TvocMax || tVOC < TvocMin) {
-                turn_on = 1;
-            } else {
-                turn_on = 0;
-            }
-        }
-        pthread_mutex_unlock(&data_mutex);
-
-        // Contrôlez le relais en fonction de la variable turn_on
-        if (turn_on && !relay_state) {
-            digitalWrite(RELAY_PIN, HIGH);
-            relay_state = 1;
-        } else if (!turn_on && relay_state) {
-            digitalWrite(RELAY_PIN, LOW);
-            relay_state = 0;
-        }
-
-        // Attendez un moment avant de vérifier à nouveau les conditions
-        sleep(10);
+    // Boucle principale du serveur WebSocket
+    while (1)
+    {
+        lws_service(context, 0);
+        usleep(1000);
     }
 }
-
-// Mettre à jour la base de données avec les nouvelles mesures et l'état du relais
-void update_database(int temp, int humidity, int eCO2, int tVOC, int relay_state) {
-    char query[256];
-    sprintf(query, "INSERT INTO Logs (T, H, eCO2, Tvoc, etatVMC) VALUES (%d, %d, %d, %d, %d)", temp, humidity, eCO2, tVOC, relay_state);
-
-    if (mysql_query(conn, query)) {
-        fprintf(stderr, "%s\n", mysql_error(conn));
-    }
-}
-
-// Initialiser la connexion à la base de données
-void init_database() {
-    const char *server = "localhost";
-    const char *user = "your_username";
-    const char *password = "your_password";
-    const char *database = "ventilation_db";
-
-    conn = mysql_init(NULL);
-
-    if (!mysql_real_connect(conn, server, user, password, database, 0, NULL, 0)) {
-        fprintf(stderr, "%s\n", mysql_error(conn));
-        exit(1);
-    }
-}
-
-// Récupérer les paramètres de la table Param
-void fetch_parameters() {
-    MYSQL_RES *result;
-    MYSQL_ROW row;
-
-    if (mysql_query(conn, "SELECT * FROM Param ORDER BY id DESC LIMIT 1")) {
-        fprintf(stderr, "%s\n", mysql_error(conn));
-        exit(1);
-    }
-
-    result = mysql_store_result(conn);
-
-    if ((row = mysql_fetch_row(result)) != NULL) {
-        Tmax = atoi(row[1]);
-        Tmin = atoi(row[2]);
-        Hmax = atoi(row[3]);
-        Hmin = atoi(row[4]);
-        eCO2Max = atoi(row[5]);
-        eCO2Min = atoi(row[6]);
-        TvocMax = atoi(row[7]);
-        TvocMin = atoi(row[8]);
-        dVentileMax = atoi(row[9]);
-        dVentileMin = atoi(row[10]);
-        etatVMC = atoi(row[11]);
-    }
-
-    mysql_free_result(result);
-}
-
-// Gérer les requêtes HTTP pour l'API REST
-int handle_http_request(void *cls, struct MHD_Connection *connection, const char *url, const char *method, const char *version, const char *upload_data, size_t *upload_data_size, void **ptr) {
-    static int dummy;
-    if (&dummy != *ptr) {
-        *ptr = &dummy;
-        return MHD_YES;
-    }
-
-    int ret;
-    struct MHD_Response *response;
-
-    if (strcmp(url, "/api/sensor_data") == 0) {
-        // Gérer la requête GET pour les données des capteurs
-        if (strcmp(method, "GET") == 0) {
-            pthread_mutex_lock(&data_mutex);
-
-            json_object *jobj = json_object_new_object();
-            json_object_object_add(jobj, "temperature", json_object_new_int(temp));
-            json_object_object_add(jobj, "humidity", json_object_new_int(humidity));
-            json_object_object_add(jobj, "eCO2", json_object_new_int(eCO2));
-            json_object_object_add(jobj, "tVOC", json_object_new_int(tVOC));
-            json_object_object_add(jobj, "relay_state", json_object_new_int(relay_state));
-
-            const char *response_data = json_object_to_json_string(jobj);
-            response = MHD_create_response_from_buffer(strlen(response_data), (void *)response_data, MHD_RESPMEM_MUST_COPY);
-            MHD_add_response_header(response, "Content-Type", "application/json");
-            ret = MHD_queue_response(connection, MHD_HTTP_OK, response);
-
-            pthread_mutex_unlock(&data_mutex);
-            json_object_put(jobj);
-            MHD_destroy_response(response);
-        } else {
-            // Unsupported method
-            ret = MHD_queue_response(connection, MHD_HTTP_METHOD_NOT_ALLOWED, NULL);
-        }
-    } else if (strcmp(url, "/api/update_parameters") == 0) {
-        // Gérer la requête POST pour mettre à jour les paramètres
-        if (strcmp(method, "POST") == 0) {
-            if (*upload_data_size != 0) {
-                json_object *jobj = json_object_new_object();
-                json_object *parsed_json = json_tokener_parse(upload_data);
-
-                json_object_object_foreach(parsed_json, key, val) {
-                    if (json_object_is_type(val, json_type_int)) {
-                        json_object_object_add(jobj, key, json_object_new_int(json_object_get_int(val)));
-                    }
-                }
-
-                const char *response_data = json_object_to_json_string(jobj);
-                response = MHD_create_response_from_buffer(strlen(response_data), (void *)response_data, MHD_RESPMEM_MUST_COPY);
-                MHD_add_response_header(response, "Content-Type", "application/json");
-                ret = MHD_queue_response(connection, MHD_HTTP_OK, response);
-
-                pthread_mutex_lock(&data_mutex);
-                update_parameters(jobj);
-                pthread_mutex_unlock(&data_mutex);
-
-                *upload_data_size = 0;
-
-                json_object_put(parsed_json);
-                json_object_put(jobj);
-                MHD_destroy_response(response);
-            } else {
-                ret = MHD_YES;
-            }
-        } else {
-            // Unsupported method
-            ret = MHD_queue_response(connection, MHD_HTTP_METHOD_NOT_ALLOWED, NULL);
-        }
-    } else {
-        // URL non prise en charge
-        ret = MHD_queue_response(connection, MHD_HTTP_NOT_FOUND, NULL);
-    }
-
-    return ret;
-}
-
-void update_parameters(json_object *jobj) {
-    json_object *jvalue;
-    if (    json_object_object_get_ex(jobj, "Tmax", &jvalue)) {
-        Tmax = json_object_get_int(jvalue);
-    }
-    if (json_object_object_get_ex(jobj, "Tmin", &jvalue)) {
-        Tmin = json_object_get_int(jvalue);
-    }
-    if (json_object_object_get_ex(jobj, "Hmax", &jvalue)) {
-        Hmax = json_object_get_int(jvalue);
-    }
-    if (json_object_object_get_ex(jobj, "Hmin", &jvalue)) {
-        Hmin = json_object_get_int(jvalue);
-    }
-    if (json_object_object_get_ex(jobj, "eCO2Max", &jvalue)) {
-        eCO2Max = json_object_get_int(jvalue);
-    }
-    if (json_object_object_get_ex(jobj, "eCO2Min", &jvalue)) {
-        eCO2Min = json_object_get_int(jvalue);
-    }
-    if (json_object_object_get_ex(jobj, "TvocMax", &jvalue)) {
-        TvocMax = json_object_get_int(jvalue);
-    }
-    if (json_object_object_get_ex(jobj, "TvocMin", &jvalue)) {
-        TvocMin = json_object_get_int(jvalue);
-    }
-    if (json_object_object_get_ex(jobj, "dVentileMax", &jvalue)) {
-        dVentileMax = json_object_get_int(jvalue);
-    }
-    if (json_object_object_get_ex(jobj, "dVentileMin", &jvalue)) {
-        dVentileMin = json_object_get_int(jvalue);
-    }
-    if (json_object_object_get_ex(jobj, "etatVMC", &jvalue)) {
-        etatVMC = json_object_get_int(jvalue);
-    }
-
-    // Mettre à jour la table Param dans la base de données
-    char query[512];
-    sprintf(query, "INSERT INTO Param (Tmax, Tmin, Hmax, Hmin, eCO2Max, eCO2Min, TvocMax, TvocMin, dVentileMax, dVentileMin, etatVMC) VALUES (%d, %d, %d, %d, %d, %d, %d, %d, %d, %d, %d)", Tmax, Tmin, Hmax, Hmin, eCO2Max, eCO2Min, TvocMax, TvocMin, dVentileMax, dVentileMin, etatVMC);
-
-    if (mysql_query(conn, query)) {
-        fprintf(stderr, "%s\n", mysql_error(conn));
-    }
-}
-
-
