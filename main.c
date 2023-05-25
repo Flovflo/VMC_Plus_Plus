@@ -275,16 +275,16 @@ int callback_ws(struct lws *wsi, enum lws_callback_reasons reason, void *user, v
     //mode automatique
     if(automatique==1){
 			pthread_mutex_lock(&data_mutex);
-			if(dht11_val[0]>Hmax || dht11_val[2]>Tmax){//si temperature > 39° et humidité > 70%
-				printf("allume\n");
-                digitalWrite(RelayPin, LOW); // Met le GPIO à LOW pour activer le relais
-				
-			}else{
-				printf("éteint\n");
-                digitalWrite(RelayPin, HIGH); // Met le GPIO à HIGH pour désactiver le relais
-			}
-            lws_callback_on_writable(wsi); 
+		if(dht11_val[0]>Hmax || dht11_val[2]>Tmax){//si temperature > 39° et humidité > 70%
+			printf("allume\n");
+               		digitalWrite(RelayPin, LOW);		
+		}else{
+			printf("éteint\n");
+               		digitalWrite(RelayPin, HIGH); 
+		}
+            		lws_callback_on_writable(wsi); 
 			pthread_mutex_unlock(&data_mutex);
+            		sleep(60);  
 	}
 
     return 0;
