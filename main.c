@@ -1,4 +1,3 @@
-#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <curl/curl.h>
@@ -46,6 +45,28 @@ int callback_ws(struct lws *wsi, enum lws_callback_reasons reason, void *user, v
 	};
 	int automatique = 0;
 
+/*
+ *Function :  auto_mode
+ *Description : Nouvelle fonction pour le thread du mode automatique
+ */
+void *auto_mode(void *arg) {
+    while (1) {
+        pthread_mutex_lock(&auto_mutex);
+        if (automatique == 1) {
+            if (dht11_val[0] > Hmax || dht11_val[2] > Tmax) {
+                printf("allume\n");
+                digitalWrite(RelayPin, LOW);
+            } else {
+                printf("éteint\n");
+                digitalWrite(RelayPin, HIGH);
+            }
+        }
+        pthread_mutex_unlock(&auto_mutex);
+        sleep(60);
+    }
+}
+
+
 // Point d'entrée du programme
 int main() {
   
@@ -75,14 +96,14 @@ int main() {
         return -1;
     }
 
-	pthread_mutex_init(&data_mutex, NULL); // Initialisation du mutex
-  pthread_t thread1, thread2, thread3; // Threads pour exécuter les fonctions de mesure, de contrôle, requete getLog,de changement de param
-  pthread_create(&thread1, NULL, MessureAction, NULL);
-  pthread_create(&thread2, NULL, control_relay, NULL);
-  //pthread_create(&thread3, NULL, GetLogs, NULL);
-
-  pthread_join(thread1, NULL); // Attendre que les threads se terminent
-  pthread_join(thread2, NULL);
+	pthread_mutex_init(&auto_mutex, NULL); // Initialisation du mutex pour automatique
+    pthread_t thread1, thread2, thread3, thread4; // Ajout d'un nouveau thread
+    pthread_create(&thread1, NULL, MessureAction, NULL);
+    pthread_create(&thread2, NULL, control_relay, NULL);
+    pthread_create(&thread4, NULL, auto_mode, NULL); // Création du nouveau thread
+    pthread_join(thread1, NULL); 
+    pthread_join(thread2, NULL);
+    pthread_join(thread4, NULL);
 
   //pthread_mutex_destroy(&data_mutex); // Destruction du mutex
 	
@@ -223,36 +244,23 @@ int callback_ws(struct lws *wsi, enum lws_callback_reasons reason, void *user, v
             //printf("%s !!",message);
 
             // Vous pouvez traiter les messages ici et envoyer une réponse si nécessaire
-            if(strcmp(message, "0")==0){
-                automatique=0;
-                // Eteint VMC
-                printf("éteint\n");
-                digitalWrite(RelayPin, HIGH); // Met le GPIO à HIGH pour désactiver le relais
-                //printf("Relais désactivé\n");
-                //lws_write(wsi, (unsigned char*)"VMC éteinte", 12, LWS_WRITE_TEXT);
-                //lws_write(wsi, (unsigned char*)"VMC off", sizeof("VMC off"), LWS_WRITE_TEXT);
-                //Eteint VMC
-                
-                
-            }
-            else if(strcmp(message, "1")==0){
-                automatique=0;
-                // allume VMC
-                printf("allume\n");
-                digitalWrite(RelayPin, LOW); // Met le GPIO à LOW pour activer le relais
-                //lws_write(wsi, (unsigned char*)"VMC allumé", sizeof("VMC allumé"), LWS_WRITE_TEXT);
-                //printf("Relais activé\n");
-                //lws_write(wsi, (unsigned char*)"VMC allumée", sizeof("VMC allumée"), LWS_WRITE_TEXT);
-                //allume VMC
-                
-            }
-            else if (strcmp(message, "2")==0){
-				automatique=1;
-            }
-            else{
-					//printf("Valeur inattendue\n");
-					//lws_write(wsi, (unsigned char*)"Valeur inattendue", sizeof("Valeur inattendue"), LWS_WRITE_TEXT);
-				}
+           if (strcmp(message, "0") == 0) {
+            pthread_mutex_lock(&auto_mutex);
+            automatique = 0;
+            pthread_mutex_unlock(&auto_mutex);
+            printf("éteint\n");
+            digitalWrite(RelayPin, HIGH);
+        } else if (strcmp(message, "1") == 0) {
+            pthread_mutex_lock(&auto_mutex);
+            automatique = 0;
+            pthread_mutex_unlock(&auto_mutex);
+            printf("allume\n");
+            digitalWrite(RelayPin, LOW);
+        } else if (strcmp(message, "2") == 0) {
+            pthread_mutex_lock(&auto_mutex);
+            automatique = 1;
+            pthread_mutex_unlock(&auto_mutex);
+        }
             break;
 
             case LWS_CALLBACK_SERVER_WRITEABLE:
@@ -271,23 +279,7 @@ int callback_ws(struct lws *wsi, enum lws_callback_reasons reason, void *user, v
         default:
             break;
     }
-    
-    //mode automatique
-    if(automatique==1){
-			pthread_mutex_lock(&data_mutex);
-		if(dht11_val[0]>Hmax || dht11_val[2]>Tmax){//si temperature > 39° et humidité > 70%
-			printf("allume\n");
-               		digitalWrite(RelayPin, LOW);		
-		}else{
-			printf("éteint\n");
-               		digitalWrite(RelayPin, HIGH); 
-		}
-            		lws_callback_on_writable(wsi); 
-			pthread_mutex_unlock(&data_mutex);
-            		sleep(60);  
-	}
 
-    return 0;
 }
 
 /*
