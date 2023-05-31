@@ -1,3 +1,4 @@
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <curl/curl.h>
@@ -8,66 +9,40 @@
 #include <libwebsockets.h>
 #include <sqlite3.h>
 
-//compilation : gcc main8.c -o exe -lwiringPi -lsqlite3 -lpthread -lwebsockets
+//compilation : gcc main6.c -o exe -lwiringPi -lsqlite3 -lpthread -lwebsockets
 
-//define DHT11
 #define MAX_TIME 85
 #define DHT11PIN 2
 
-#define Hmax 70
+#define Hmax 90
 #define Tmax 39
 
-//define relais
 #define RelayPin 0  // Correspond à GPIO17 si vous utilisez WiringPi
 
-//definitions des fonctions
 void dht11_read_val();
 int insertLog(int t, int h, int eco, int tvoc, int etatVMC);
 void *MessureAction(void *arg);
 void *control_relay(void *arg);
 int callback_ws(struct lws *wsi, enum lws_callback_reasons reason, void *user, void *in, size_t len);
 
-//variables globales
-	//valeurs mesurés par le DHT11
-	int dht11_val[5]={0,0,0,0,0};
-	// Mutex pour protéger les variables de température, d'humidité et d'état VMC
-	pthread_mutex_t data_mutex; 
-	// Déclaration de la structure pour le contexte du serveur WebSocket
-	struct lws_context *context;
-	struct lws_protocols protocols[] = {
-		{
-			"vmc-protocol",
-			callback_ws,
-			0,
-			0,
-		},
-		{ NULL, NULL, 0, 0 } // terminateur de tableau
-	};
-	int automatique = 0;
+int current_relay_state = -1;
+int dht11_val[5]={0,0,0,0,0};
+pthread_mutex_t data_mutex;
+struct lws_context *context;
+struct lws_protocols protocols[] = {
+	{
+		"vmc-protocol",
+		callback_ws,
+		0,
+		0,
+	},
+	{ NULL, NULL, 0, 0 }
+};
+int automatique = 1;
 
-/*
- *Function :  auto_mode
- *Description : Nouvelle fonction pour le thread du mode automatique
- */
-void *auto_mode(void *arg) {
-    while (1) {
-        pthread_mutex_lock(&auto_mutex);
-        if (automatique == 1) {
-            if (dht11_val[0] > Hmax || dht11_val[2] > Tmax) {
-                printf("allume\n");
-                digitalWrite(RelayPin, LOW);
-            } else {
-                printf("éteint\n");
-                digitalWrite(RelayPin, HIGH);
-            }
-        }
-        pthread_mutex_unlock(&auto_mutex);
-        sleep(60);
-    }
-}
+int temp = 0;
+int hum = 0;
 
-
-// Point d'entrée du programme
 int main() {
   
   struct lws_context_creation_info info;
@@ -78,8 +53,7 @@ int main() {
       return -1; 
   }
   
-	pinMode(RelayPin, OUTPUT);
-    // Configuration du contexte du serveur WebSocket
+  pinMode(RelayPin, OUTPUT);
     info.port = 8000;
     info.iface = NULL;
     info.protocols = protocols;
@@ -87,8 +61,7 @@ int main() {
     info.gid = -1;
     info.uid = -1;
     info.options |= LWS_SERVER_OPTION_DO_SSL_GLOBAL_INIT;
-
-    // Création du contexte du serveur WebSocket
+    
     context = lws_create_context(&info);
     if (context == NULL)
     {
@@ -96,27 +69,17 @@ int main() {
         return -1;
     }
 
-	pthread_mutex_init(&auto_mutex, NULL); // Initialisation du mutex pour automatique
-    pthread_t thread1, thread2, thread3, thread4; // Ajout d'un nouveau thread
-    pthread_create(&thread1, NULL, MessureAction, NULL);
-    pthread_create(&thread2, NULL, control_relay, NULL);
-    pthread_create(&thread4, NULL, auto_mode, NULL); // Création du nouveau thread
-    pthread_join(thread1, NULL); 
-    pthread_join(thread2, NULL);
-    pthread_join(thread4, NULL);
+	pthread_mutex_init(&data_mutex, NULL); 
+  pthread_t thread1, thread2;
+  pthread_create(&thread1, NULL, MessureAction, NULL);
+  pthread_create(&thread2, NULL, control_relay, NULL);
+  
+  pthread_join(thread1, NULL);
+  pthread_join(thread2, NULL);
 
-  //pthread_mutex_destroy(&data_mutex); // Destruction du mutex
-	
-	// Destruction du contexte du serveur WebSocket
-    //lws_context_destroy(context);
-    
   return 0;
 }
 
-/*
- *Function :  MessureAction
- *Description : thread enregistrant continuellement les mesures du capteurs dans la BDD
- */
 void *MessureAction(void *arg) {
   while(1)
   {
@@ -172,7 +135,12 @@ void dht11_read_val()
   {
     farenheit=dht11_val[2]*9./5.+32;
     printf("Humidity = %d.%d %% Temperature = %d.%d *C (%.1f *F)\n",dht11_val[0],dht11_val[1],dht11_val[2],dht11_val[3],farenheit);
-    insertLog(dht11_val[2], dht11_val[0], dht11_val[1], dht11_val[3], !digitalRead(RelayPin));
+
+    // Mise à jour des variables globales avec les valeurs tronquées de la température et de l'humidité
+    temp = dht11_val[2];
+    hum = dht11_val[0];
+
+    insertLog(temp, hum, dht11_val[1], dht11_val[3], !digitalRead(RelayPin));
   }
   //else
     //rintf("Invalid Data!!\n");
@@ -244,43 +212,47 @@ int callback_ws(struct lws *wsi, enum lws_callback_reasons reason, void *user, v
             //printf("%s !!",message);
 
             // Vous pouvez traiter les messages ici et envoyer une réponse si nécessaire
-           if (strcmp(message, "0") == 0) {
-            pthread_mutex_lock(&auto_mutex);
-            automatique = 0;
-            pthread_mutex_unlock(&auto_mutex);
-            printf("éteint\n");
-            digitalWrite(RelayPin, HIGH);
-        } else if (strcmp(message, "1") == 0) {
-            pthread_mutex_lock(&auto_mutex);
-            automatique = 0;
-            pthread_mutex_unlock(&auto_mutex);
-            printf("allume\n");
-            digitalWrite(RelayPin, LOW);
-        } else if (strcmp(message, "2") == 0) {
-            pthread_mutex_lock(&auto_mutex);
-            automatique = 1;
-            pthread_mutex_unlock(&auto_mutex);
-        }
+            if(strcmp(message, "0")==0){
+                automatique=0;
+                // Eteint VMC
+                printf("éteint\n");
+                digitalWrite(RelayPin, HIGH); // Met le GPIO à HIGH pour désactiver le relais
+                //printf("Relais désactivé\n");
+                //lws_write(wsi, (unsigned char*)"VMC éteinte", 12, LWS_WRITE_TEXT);
+                //lws_write(wsi, (unsigned char*)"VMC off", sizeof("VMC off"), LWS_WRITE_TEXT);
+                //Eteint VMC
+                
+                
+            }
+            else if(strcmp(message, "1")==0){
+                automatique=0;
+                // allume VMC
+                printf("allume\n");
+                digitalWrite(RelayPin, LOW); // Met le GPIO à LOW pour activer le relais
+                //lws_write(wsi, (unsigned char*)"VMC allumé", sizeof("VMC allumé"), LWS_WRITE_TEXT);
+                //printf("Relais activé\n");
+                //lws_write(wsi, (unsigned char*)"VMC allumée", sizeof("VMC allumée"), LWS_WRITE_TEXT);
+                //allume VMC
+                
+            }
+            else if (strcmp(message, "2")==0){
+				automatique=1;
+            }
+            else{
+					//printf("Valeur inattendue\n");
+					//lws_write(wsi, (unsigned char*)"Valeur inattendue", sizeof("Valeur inattendue"), LWS_WRITE_TEXT);
+				}
             break;
-
-            case LWS_CALLBACK_SERVER_WRITEABLE:
-                {
-                    char buf[LWS_PRE + 512];
-                    char *p = &buf[LWS_PRE];
-                    pthread_mutex_lock(&data_mutex);
-                    int n = sprintf(p, "Humidity = %d.%d %% Temperature = %d.%d *C",
-                                    dht11_val[0], dht11_val[1], dht11_val[2], dht11_val[3]);
-                    pthread_mutex_unlock(&data_mutex);
-                    lws_write(wsi, (unsigned char*)p, n, LWS_WRITE_TEXT);
-                    break;
-                }
-
 
         default:
             break;
     }
 
+
+
+    return 0;
 }
+
 
 /*
  *Function :  control_relay
@@ -292,5 +264,26 @@ void *control_relay(void *arg) {
     {
         lws_service(context, 0);
         usleep(1000);
+
+        // Contrôle automatique
+        if(automatique==1){
+            
+			pthread_mutex_lock(&data_mutex);
+			if(hum>Hmax || temp>Tmax){ //si temperature > Tmax et humidité > Hmax
+				if(current_relay_state != 1) { // vérifie si le relais est déjà allumé
+					printf("allume\n");
+					digitalWrite(RelayPin, LOW); // Met le GPIO à LOW pour activer le relais
+					current_relay_state = 1;
+				}
+			}else{
+				if(current_relay_state != 0) { // vérifie si le relais est déjà éteint
+					printf("éteint\n");
+					digitalWrite(RelayPin, HIGH); // Met le GPIO à HIGH pour désactiver le relais
+					current_relay_state = 0;
+				}
+			}
+			pthread_mutex_unlock(&data_mutex);
     }
+    }
+    return NULL;
 }
