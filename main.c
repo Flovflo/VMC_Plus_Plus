@@ -9,7 +9,7 @@
 #include <libwebsockets.h>
 #include <sqlite3.h>
 
-//compilation : gcc main6.c -o exe -lwiringPi -lsqlite3 -lpthread -lwebsockets
+//compilation : gcc main6.c -o exe -lwiringPi -lsqlite3 -lpthread -lwebsockets -lcjson
 
 #define MAX_TIME 85
 #define DHT11PIN 2
@@ -202,6 +202,20 @@ int callback_ws(struct lws *wsi, enum lws_callback_reasons reason, void *user, v
     {
         case LWS_CALLBACK_ESTABLISHED:
             printf("Connexion WebSocket établie\n");
+
+            // Crée un objet JSON avec les valeurs de temp et hum
+            cJSON *root = cJSON_CreateObject();
+            cJSON_AddNumberToObject(root, "temperature", temp);
+            cJSON_AddNumberToObject(root, "humidity", hum);
+            cJSON_AddNumberToObject(root, "etatVMC", current_relay_state);
+
+            // Convertit l'objet JSON en une chaîne
+            char *json_string = cJSON_Print(root);
+            printf("Envoi des valeurs initiales : %s\n", json_string);
+
+            // Envoie la chaîne au client
+            lws_write(wsi, (unsigned char*)json_string, strlen(json_string), LWS_WRITE_TEXT);
+
             break;
 
         case LWS_CALLBACK_RECEIVE:
